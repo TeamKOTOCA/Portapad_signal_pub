@@ -1,0 +1,2 @@
+# Portapad_signal_pub
+Portapadのシグナリングサーバーの公開用リポジトリ
