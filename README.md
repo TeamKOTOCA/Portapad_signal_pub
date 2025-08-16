@@ -56,3 +56,5 @@ Portapad のシグナリングサーバーの公開用リポジトリです。
 ## ライセンス
 
 このプロジェクトは [CC BY-SA](https://creativecommons.org/licenses/by-sa/4.0/deed.ja) ライセンスの下で提供されています。
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/TeamKOTOCA/Portapad_signal_pub)
