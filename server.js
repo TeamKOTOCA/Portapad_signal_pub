@@ -1,180 +1,266 @@
-const express = require('express');
 const https = require('https');
 const fs = require('fs');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
-const app = express();
-
-// SSL証明書と秘密鍵を読み込む
+const PORT = 8443;
 const options = {
   key: fs.readFileSync('privkey.pem'),
-  cert: fs.readFileSync('fullchain.pem')
+  cert: fs.readFileSync('fullchain.pem'),
 };
 
-// HTTPSサーバー作成
-const server = https.createServer(options, app);
-const wss = new WebSocket.Server({ server });
+/**
+ * 接続一覧
+ * id -> { ws, role, ipAddress }
+ */
+const connections = new Map();
 
-// HTML出力
-app.get('/', (req, res) => {
-  const htmlContent = `
-    <!DOCTYPE html>
-    <html lang="ja">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Portapad Signaling Server(Pubmodel)</title>
-    </head>
-    <body style="text-align: center;">
-        <h1>Portapad Signaling Server</h1>
-        <p>シグナリングサーバーは起動中です。</p>
-    </body>
-    </html>
-  `;
-  res.send(htmlContent);
+function normalizeIp(address) {
+  if (!address) {
+    return 'unknown';
+  }
+  return address.replace(/^::ffff:/, '').replace(/^::1$/, '127.0.0.1');
+}
+
+function getConnectionIdBySocket(ws) {
+  for (const [id, entry] of connections.entries()) {
+    if (entry.ws === ws) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function cleanupSocket(ws) {
+  const removed = [];
+  for (const [id, entry] of connections.entries()) {
+    if (entry.ws === ws) {
+      connections.delete(id);
+      removed.push(id);
+    }
+  }
+  return removed;
+}
+
+function registerConnection(ws, role, ipAddress) {
+  cleanupSocket(ws);
+  const id = crypto.randomUUID();
+  connections.set(id, { ws, role, ipAddress });
+  return id;
+}
+
+function sendToClient(clientId, payload) {
+  const entry = connections.get(clientId);
+  if (!entry) {
+    return false;
+  }
+
+  if (entry.ws.readyState !== WebSocket.OPEN) {
+    connections.delete(clientId);
+    return false;
+  }
+
+  entry.ws.send(JSON.stringify(payload));
+  return true;
+}
+
+function parseBody(body) {
+  if (body && typeof body === 'object') {
+    return body;
+  }
+
+  if (typeof body === 'string') {
+    return JSON.parse(body);
+  }
+
+  return body;
+}
+
+function getHostIds() {
+  return Array.from(connections.entries())
+    .filter(([, entry]) => entry.role === 'host' && entry.ws.readyState === WebSocket.OPEN)
+    .map(([id]) => id);
+}
+
+function getClientSnapshot() {
+  return Array.from(connections.entries()).map(([id, entry]) => ({
+    id,
+    role: entry.role,
+    ipAddress: entry.ipAddress,
+    readyState: entry.ws.readyState,
+  }));
+}
+
+const server = https.createServer(options, (req, res) => {
+  const url = new URL(req.url, `https://${req.headers.host || 'localhost'}`);
+
+  if (req.method === 'GET' && url.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PortaPad Signaling Server</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+        background: #f6f8fc;
+        color: #1f2a37;
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+      }
+      main {
+        width: min(560px, calc(100vw - 32px));
+        background: white;
+        border: 1px solid #d3deee;
+        border-radius: 16px;
+        box-shadow: 0 6px 24px rgba(20, 100, 204, 0.12);
+        padding: 28px;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      .status {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: #e7f4ff;
+        color: #145ca8;
+        font-weight: 700;
+      }
+      p {
+        line-height: 1.7;
+      }
+      code {
+        background: #f1f5f9;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>PortaPad Signaling Server</h1>
+      <p class="status">稼働中</p>
+      <p>WebRTC のシグナリングを中継しています。<br>Web クライアントと Windows ホストの両方から接続してください。</p>
+      <p>接続先の既定値は <code>wss://localhost:8443</code> です。</p>
+    </main>
+  </body>
+</html>`);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({
+      ok: true,
+      hosts: getHostIds().length,
+      clients: connections.size,
+    }));
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not Found');
 });
 
-const clients = new Map();
+const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-  const ipAddress = req.socket.remoteAddress
-    .replace(/^::ffff:/, '')
-    .replace(/^::1$/, '127.0.0.1');
-  console.log(ipAddress);
-  console.log('WebSocketで接続');
+  const ipAddress = normalizeIp(req.socket.remoteAddress);
+  console.log(`接続: ${ipAddress}`);
 
-  ws.on('message', (message) => {
-    console.log('メッセージが来たぞぉ! ->', message);
-    console.log('クライアントのIP、', ipAddress , "みたいだわ");
+  let registeredId = null;
+
+  ws.on('message', rawMessage => {
+    const message = rawMessage.toString();
+    console.log(`受信: ${message}`);
+
+    if (message === 'host') {
+      registeredId = registerConnection(ws, 'host', ipAddress);
+      ws.send(JSON.stringify({
+        mtype: 'myname',
+        fromhost: 'nohoost-nohost-nohost',
+        body: registeredId,
+      }));
+      return;
+    }
+
+    if (message === 'client') {
+      registeredId = registerConnection(ws, 'client', ipAddress);
+      return;
+    }
+
+    if (message === 'hostview') {
+      ws.send(JSON.stringify({
+        mtype: 'hosts',
+        fromhost: null,
+        body: JSON.stringify(getHostIds()),
+      }));
+      return;
+    }
+
+    if (message === 'viewclients') {
+      ws.send(JSON.stringify(getClientSnapshot()));
+      return;
+    }
+
+    let parsed;
     try {
-      const jmessage = JSON.parse(message);
-      if(jmessage.mtype == "sdpoffer"){
-        console.log("SDPのofferだってさ");
-        try{
-          const sdp = JSON.parse(jmessage.body);
-          const inclients = clients.get(ipAddress);
-          const [, clientws] = inclients.get(jmessage.tohost);
-          const fromhost = getipfromws(ipAddress, ws);
+      parsed = JSON.parse(message);
+    } catch {
+      return;
+    }
 
-          const sdpbypass = {
-            mtype: "sdp",
-            fromhost: fromhost,
-            body: sdp
-          };
-          clientws.send(JSON.stringify(sdpbypass));
-          console.log(sdpbypass.fromhost);
-        }catch(e){
-          console.log("エラー:" + e);
-        }
-      } else if(jmessage.mtype == "ice"){
-        console.log("ICEのofferだってさ");
-        try{
-          const inclients = clients.get(ipAddress);
-          const [, clientws] = inclients.get(jmessage.tohost);
-          const fromhost = getipfromws(ipAddress, ws);
+    if (parsed.mtype !== 'sdpoffer' && parsed.mtype !== 'ice') {
+      return;
+    }
 
-          const icebypass = {
-            mtype: "ice",
-            fromhost: fromhost,
-            body: JSON.parse(jmessage.body)
-          };
-          clientws.send(JSON.stringify(icebypass));
-          console.log(icebypass.fromhost);
-        }catch(e){
-          console.log("エラー:" + e);
-        }
-      }
-    } catch (e) {
-      if(message == "host"){
-        makeitems(ipAddress, true, ws);
-        let sendmessage = {
-          mtype: "myname",
-          fromhost: "nohoost-nohost-nohost",
-          body: getipfromws(ipAddress, ws)
-        };
-        ws.send(JSON.stringify(sendmessage));
-      } else if(message == "client"){
-        makeitems(ipAddress, false, ws);
-      } else if(message == "viewclients"){
-        const getipaddress = clients.get(ipAddress);
-        try{
-          const jsonString = JSON.stringify(Array.from(getipaddress.entries()));
-          ws.send(jsonString);
-          console.log(jsonString);
-        }catch(e){
-          console.log("clientsendでエラー出てるけど大丈夫そ？");
-        }
-      } else if(message == "hostview"){
-        const getipaddress = clients.get(ipAddress);
-        if (!getipaddress) return;
-        const hostKeys = Array.from(getipaddress.entries())
-          .filter(([_, [isHost]]) => isHost)
-          .map(([key]) => key);
-        try {
-          let sendhosts = {
-            mtype: "hosts",
-            fromhost: null,
-            body: JSON.stringify(hostKeys)
-          };
-          ws.send(JSON.stringify(sendhosts));
-          console.log("送信したホスト一覧: ", hostKeys);
-        } catch (e) {
-          console.log("hostviewの送信エラー:", e);
-        }
-      }
+    const targetId = parsed.tohost;
+    const fromhost = getConnectionIdBySocket(ws) || registeredId;
+    if (!targetId || !fromhost) {
+      return;
+    }
+
+    let body;
+    try {
+      body = parseBody(parsed.body);
+    } catch (error) {
+      console.log(`本文の解析に失敗: ${error}`);
+      return;
+    }
+
+    const payload = {
+      mtype: parsed.mtype === 'sdpoffer' ? 'sdp' : 'ice',
+      fromhost,
+      body,
+    };
+
+    if (!sendToClient(targetId, payload)) {
+      console.log(`転送失敗: target=${targetId}, from=${fromhost}`);
     }
   });
 
   const pingInterval = setInterval(() => {
-    ws.ping();
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
   }, 30000);
-  ws.on('pong', () => {});
 
   ws.on('close', () => {
-    if (clients.has(ipAddress)) {
-      const ipMap = clients.get(ipAddress);
-      for (let [key, client] of ipMap) {
-        const [, clientSocket] = client;
-        if (ws === clientSocket) {
-          ipMap.delete(key);
-          console.log(`削除されたクライアント: ${key}`);
-        }
-      }
-      if (ipMap.size === 0) {
-        clients.delete(ipAddress);
-        console.log(`IPアドレス ${ipAddress} の情報も削除されました。`);
-      }
-    }
     clearInterval(pingInterval);
-    console.log('WebSocketの接続が解除された');
+    const removed = cleanupSocket(ws);
+    console.log(`切断: ${ipAddress} (${removed.join(', ') || 'no-id'})`);
+  });
+
+  ws.on('error', error => {
+    console.log(`WebSocket エラー: ${ipAddress} ${error.message}`);
   });
 });
 
-function makeitems(ipAddress, isHost, ws) {
-  if(!clients.has(ipAddress)){
-    clients.set(ipAddress, new Map());
-  }
-  const inipmap = clients.get(ipAddress);
-  const geneid = geneId();
-  inipmap.set(geneid, [isHost, ws]);
-  console.log(`ip: ${ipAddress} ,id: ${geneid} ,ishost ${isHost}`);
-}
-
-function geneId() {
-  return crypto.randomUUID();
-}
-
-function getipfromws(ipAddress, ws){
-  const ipMap = clients.get(ipAddress);
-  for (const [id, [isHost, socket]] of ipMap.entries()) {
-    if (socket === ws) {
-      return id;
-    }
-  }
-}
-
-const PORT = 8443;
 server.listen(PORT, () => {
   console.log(`HTTPS Server is started at https://localhost:${PORT}`);
 });
